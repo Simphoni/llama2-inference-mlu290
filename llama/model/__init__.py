@@ -7,3 +7,4 @@ from .attention import SelfAttention
 from .encoder import EncoderBlock
 from .ffn import FeedForward
 from .transformer import Transformer
+from .dummy_transformer import DummyTransformer

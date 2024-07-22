@@ -59,13 +59,13 @@ class SelfAttention(nn.Module):
         head_dim = self.head_dim
         head_beg = n_heads_tp * self.dist_args.model_tensor_parallel_rank
         head_end = head_beg + n_heads_tp
-        self.dwq = nn.Parameter(self.wq.weight[head_beg * head_dim : head_end * head_dim, :].clone())
-        self.dwk = nn.Parameter(self.wk.weight[head_beg * head_dim : head_end * head_dim, :].clone())
-        self.dwv = nn.Parameter(self.wv.weight[head_beg * head_dim : head_end * head_dim, :].clone())
-        self.dwo = nn.Parameter(self.wo.weight[:, head_beg * head_dim : head_end * head_dim].clone())
+        self.dwq = nn.Parameter(self.wq.weight[head_beg * head_dim : head_end * head_dim, :].clone(), requires_grad=False)
+        self.dwk = nn.Parameter(self.wk.weight[head_beg * head_dim : head_end * head_dim, :].clone(), requires_grad=False)
+        self.dwv = nn.Parameter(self.wv.weight[head_beg * head_dim : head_end * head_dim, :].clone(), requires_grad=False)
+        self.dwo = nn.Parameter(self.wo.weight[:, head_beg * head_dim : head_end * head_dim].clone(), requires_grad=False)
         del self.wq, self.wk, self.wv, self.wo
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):        
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: Tuple[torch.Tensor, torch.Tensor]):
         batch_size, seq_len, _ = x.shape  # (B, 1, Dim)
 
         # (B, 1, Dim) -> (B, 1, N_Head_TP * Head_Dim)
@@ -87,11 +87,11 @@ class SelfAttention(nn.Module):
 
         # Replace the entry in the cache
         #self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk
+        #self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
         # print(self.cache_k.shape, xk.shape)
         self.cache_k = torch.cat((self.cache_k[:batch_size, :start_pos], xk), dim=1)
         # print(self.cache_k[:batch_size, start_pos : start_pos + seq_len])
         self.cache_v = torch.cat((self.cache_v[:batch_size, :start_pos], xv), dim=1)
-        #self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
 
         # (B, Seq_Len_KV, H_KV, Head_Dim)
         keys = self.cache_k[:batch_size, : start_pos + seq_len]
@@ -113,6 +113,7 @@ class SelfAttention(nn.Module):
         values = values.transpose(1, 2)
 
         # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
+        #scores = torch.matmul(xq, keys.transpose(2, 3)) * (1.0 / math.sqrt(self.head_dim))
         scores = torch.matmul(xq, keys.transpose(2, 3)) * (1.0 / math.sqrt(self.head_dim))
         # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)

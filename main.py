@@ -19,7 +19,7 @@ if __name__ == "__main__":
         # Decision: 
         # """
     ]
-    llama.inference(prompts, 64, 'cpu')
+    llama.inference(prompts, 16, 'mlu')
     
     """
     The theory of relativity states that 2 observers can have different measurements of time and space depending on their relative motion

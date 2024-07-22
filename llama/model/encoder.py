@@ -4,6 +4,7 @@ from ..global_args import ModelArgs, DistributedArgs
 from .attention import SelfAttention
 from .rmsnorm import RMSNorm
 from .ffn import FeedForward
+from typing import Tuple
 
 class EncoderBlock(nn.Module):
 
@@ -26,7 +27,7 @@ class EncoderBlock(nn.Module):
         self.attention.crop_parameters()
         self.feed_forward.crop_parameters()
     
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: Tuple[torch.Tensor, torch.Tensor]):
         # (B, Seq_Len, Dim) + (B, Seq_Len, Dim) --> (B, Seq_Len, Dim)
         h = x + self.attention.forward(
             self.attention_norm(x), start_pos, freqs_complex

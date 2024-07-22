@@ -7,16 +7,18 @@ from .global_args import DistributedArgs
 
 initialized = False
 is_single_node = False
-args_pers = None
+args_pers = DistributedArgs()
 
 def init_dev(args: DistributedArgs):
     global initialized, is_single_node, args_pers
+    if initialized:
+        return mlu_dist.get_mlu_default_group()
     args_pers = args
-    assert not initialized, "mlu.init_dev called twice"
+    #assert not initialized, "mlu.init_dev called twice"
     initialized = True
     mlu_drv.set_cnml_enabled(False)
     mlu_drv.set_device(args.device_id)
-    print(f"rank {args.local_rank} using device {args.device_id}")
+    print(f"rank {args.local_rank} using device {args.device_id}/{mlu_drv.device_count()}")
     if args.world_size == 1:
         is_single_node = True
         return None

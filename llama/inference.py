@@ -72,10 +72,9 @@ class LLaMA:
         )
 
         dist_args = get_distributed_args()
-        model_args.device = device
 
         tokenizer = SentencePieceProcessor()
-        tokenizer.load(tokenizer_path)
+        tokenizer.LoadFromFile(tokenizer_path)
         model_args.vocab_size = tokenizer.vocab_size()
         
         torch.set_default_dtype(torch.float32)
@@ -104,7 +103,7 @@ class LLaMA:
         if max_gen_len is None:
             max_gen_len = self.args.max_seq_len - 1
         # Convert each prompt into tokens
-        prompt_tokens = [self.tokenizer.encode(prompt, out_type=int, add_bos=True, add_eos=False) for prompt in prompts]
+        prompt_tokens = [self.tokenizer.Encode(prompt, out_type=int, add_bos=True, add_eos=False) for prompt in prompts]
         # Make sure the batch size is not too large
         batch_size = len(prompt_tokens)
         assert batch_size <= self.args.max_batch_size, f"batch_size{batch_size} must be less than or equal to {self.args.max_batch_size}"
@@ -125,8 +124,7 @@ class LLaMA:
         prompt_tokens_mask = tokens != pad_id # True if the token is a prompt token, False otherwise
         cur_iterator = tqdm(range(1, total_len), desc="Generating tokens")
         for cur_pos in cur_iterator:
-            gc.collect()
-            print("pos=", cur_pos, ", tokens=", tokens[:, cur_pos-1:cur_pos].cpu().contiguous().flatten())
+            #print("pos=", cur_pos, ", tokens=", tokens[:, cur_pos-1:cur_pos].cpu().contiguous().flatten())
             logits = self.model.forward(tokens[:, cur_pos-1:cur_pos], cur_pos)
             backend.report_gpu_memory_consumption()
             if temperature > 0:
@@ -141,11 +139,12 @@ class LLaMA:
             # Only replace token if it is a padding token
             tmp = next_token.clone()
             next_token = torch.where(prompt_tokens_mask[:, cur_pos], tokens[:, cur_pos], next_token)
-            print(f"where op: {prompt_tokens_mask[:, cur_pos]}, {tokens[:, cur_pos]}, {tmp} = {next_token}")
-            print(f"{tokens[:, cur_pos]} <- {next_token[:]}")
+            if self.dist_args.world_rank == 0:
+                print(f"{tokens[:, cur_pos]} <- {next_token[:]}")
             #tokens[:, cur_pos] = next_token[:]
             tokens = torch.cat((tokens[:, :cur_pos], next_token.reshape(-1, 1), tokens[:,cur_pos+1:]), dim=1)
-            print(tokens[:, cur_pos].cpu())
+            if self.dist_args.world_rank == 0:
+                print(tokens[:, cur_pos].cpu())
             # EOS is reached only if we found an EOS token for a padding position
             eos_reached |= (~prompt_tokens_mask[:, cur_pos]).cpu() & (next_token.cpu() == self.tokenizer.eos_id())
             if all(eos_reached):
@@ -159,7 +158,7 @@ class LLaMA:
                 eos_idx = current_prompt_tokens.index(self.tokenizer.eos_id)
                 current_prompt_tokens = current_prompt_tokens[:eos_idx]
             out_tokens.append(current_prompt_tokens)
-            out_text.append(self.tokenizer.decode(current_prompt_tokens))
+            out_text.append(self.tokenizer.Decode(current_prompt_tokens))
         return (out_tokens, out_text)
     
     def _sample_top_p(self, probs, p):

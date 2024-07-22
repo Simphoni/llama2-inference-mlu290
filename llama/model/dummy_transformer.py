@@ -20,7 +20,7 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, t
     return freqs_complex
 
 
-class Transformer(nn.Module):
+class DummyTransformer(nn.Module):
     def __init__(self, args: ModelArgs, dist_args: DistributedArgs):
         super().__init__()
 
@@ -29,12 +29,10 @@ class Transformer(nn.Module):
         self.args = args
         self.dist_args = dist_args
         self.vocab_size = args.vocab_size
-        self.n_layers = args.n_layers
+        self.n_layers = 1
         self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
 
-        self.layers = nn.ModuleList()
-        for _ in range(args.n_layers):
-            self.layers.append(EncoderBlock(args, dist_args))
+        self.layers = nn.ModuleList([EncoderBlock(args, dist_args)])
 
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, self.vocab_size, bias=False)
@@ -42,16 +40,16 @@ class Transformer(nn.Module):
         self.freqs_complex = precompute_theta_pos_frequencies(self.args.dim // self.args.n_heads, self.args.max_seq_len * 2, device=self.args.device)
     
     def crop_parameter(self):
-        for encoder in self.layers:
-            encoder.crop_parameter()
+        self.layers[0].crop_parameter()
 
     def forward(self, tokens: torch.Tensor, start_pos: int):
         # (B, Seq_Len)
         batch_size, seq_len = tokens.shape
-        assert seq_len == 1, "Only one token at a time can be processed"
+        assert seq_len == 1, f"Only one token at a time can be processed, got seq_len = {seq_len}"
 
         # (B, Seq_Len) -> (B, Seq_Len, Dim)
         h = self.tok_embeddings(tokens)
+        return h
 
         # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
         #freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]

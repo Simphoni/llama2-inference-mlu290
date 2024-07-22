@@ -16,7 +16,6 @@ class ModelArgs:
     max_seq_len: int = 128
 
     device: str = None
-    device_handle = None
     
 @dataclass
 class DistributedArgs:
