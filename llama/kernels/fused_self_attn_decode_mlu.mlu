@@ -1,0 +1,117 @@
+#include <mlu.h>
+
+#include "cnutils.h"
+
+namespace mlu_detail {
+
+namespace {
+
+__nram__ char nram_headptr[MAX_NRAM_BYTES];
+__mlu_shared__ char sram_headptr[MAX_SRAM_BYTES];
+
+#define swap_fp16_ptr(a, b)                                                                        \
+  {                                                                                                \
+    half *tmp = a;                                                                                 \
+    a = b;                                                                                         \
+    b = tmp;                                                                                       \
+  }
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
+
+//===== begin mlu kernels =====
+
+constexpr int ATTN_FP16_BATCH_MICROBATCH = 16;
+constexpr int ATTN_FP16_HEAD_MICROBATCH = 2;
+constexpr int ATTN_FP16_PROJ_NANOBATCH = 8;
+constexpr int ATTN_FP16_BMM_NANOBATCH = 2;
+
+__mlu_global__ void mm_fp16(half *x, half *wq, half *xq, int bs, int nheads, int head_dim) {
+  using dtype = half;
+  int core_id = coreId % 4;
+  const int parallel_size = taskDimY;
+  const int parallel_idx = taskIdY;
+  constexpr int head_microbatch = ATTN_FP16_HEAD_MICROBATCH;
+  int batch_microbatch = min(bs, ATTN_FP16_BATCH_MICROBATCH);
+  int head_chunks = nheads / head_microbatch;
+  int batch_chunks = bs / batch_microbatch;
+  int ntasks = batch_chunks * head_chunks;
+  int model_hidden_dim = nheads * head_dim;
+  int attn_hidden_dim = nheads * head_dim;
+  int proj_chunk_len = head_microbatch * head_dim;
+
+  constexpr int proj_nanobatch = ATTN_FP16_PROJ_NANOBATCH;
+  constexpr int proj_microbatch = proj_nanobatch * 4;
+  dtype *weight_sram0 = (dtype *)sram_headptr;
+  dtype *weight_sram1 = weight_sram0 + proj_microbatch * model_hidden_dim;
+  dtype *xq_sram = weight_sram1 + proj_microbatch * model_hidden_dim;
+  dtype *end_sram = xq_sram + proj_chunk_len;
+
+  dtype *x_nram = (dtype *)nram_headptr;
+  dtype *weight_nram = x_nram + batch_microbatch * model_hidden_dim;
+  dtype *buf_nram = weight_nram + proj_nanobatch * model_hidden_dim;
+  dtype *end_nram = buf_nram + proj_nanobatch * model_hidden_dim;
+
+  for (int loop_idx = parallel_idx; loop_idx < ntasks; loop_idx += parallel_size) {
+    int bs_st = loop_idx / head_chunks * batch_microbatch;
+    int head_chunk_st = loop_idx % head_chunks * head_microbatch;
+    int proj_chunk_st = head_chunk_st * head_dim;
+    int proj_ntasks = proj_chunk_len / proj_microbatch;
+    __memcpy_async(x_nram, x + bs_st * model_hidden_dim,
+                   batch_microbatch * model_hidden_dim * sizeof(dtype), GDRAM2NRAM);
+    for (int proj_idx = 0; proj_idx < proj_ntasks + 1; proj_idx++) {
+      if (proj_idx < proj_ntasks) {
+        int proj_st = proj_chunk_st + proj_idx * proj_microbatch;
+        __memcpy_async(weight_sram0, wq + proj_st * model_hidden_dim,
+                       proj_microbatch * model_hidden_dim * sizeof(dtype), GDRAM2SRAM);
+      }
+      if (proj_idx >= 1) {
+        int proj_st = (proj_idx - 1) * proj_microbatch;
+        int proj_st_core = core_id * proj_nanobatch;
+        __memcpy(weight_nram, weight_sram1 + proj_st_core * model_hidden_dim,
+                 proj_nanobatch * model_hidden_dim * sizeof(dtype), SRAM2NRAM);
+        for (int batch_idx = 0; batch_idx < batch_microbatch; batch_idx++) {
+          __bang_cycle_mul(buf_nram, weight_nram, x_nram + batch_idx * model_hidden_dim,
+                           proj_nanobatch * model_hidden_dim, model_hidden_dim);
+          __bang_reduce_sum(buf_nram, buf_nram, proj_nanobatch * model_hidden_dim);
+          for (int i = 0; i < proj_nanobatch; i++) {
+            float sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
+            for (int j = 0; j < model_hidden_dim; j += 256) {
+              sum0 += buf_nram[i * model_hidden_dim + j];
+              sum1 += buf_nram[i * model_hidden_dim + j + 64];
+              sum2 += buf_nram[i * model_hidden_dim + j + 128];
+              sum3 += buf_nram[i * model_hidden_dim + j + 192];
+            }
+            buf_nram[i] = sum0 + sum1 + sum2 + sum3;
+            // WARN: don't write GPR to SRAM
+            // e.g. xq_sram[proj_st + proj_st_core + i] = sum;
+          }
+          __memcpy(xq_sram + batch_idx * proj_chunk_len + proj_st + proj_st_core, buf_nram,
+                   proj_nanobatch * sizeof(dtype), NRAM2SRAM);
+        }
+      }
+      swap_fp16_ptr(weight_sram0, weight_sram1);
+      __sync_cluster();
+    }
+    __memcpy(xq + bs_st * attn_hidden_dim + proj_chunk_st, xq_sram, proj_chunk_len * sizeof(dtype),
+             SRAM2GDRAM, attn_hidden_dim * sizeof(dtype), proj_chunk_len * sizeof(dtype),
+             batch_microbatch - 1);
+    __sync_cluster();
+  }
+}
+
+} // namespace
+
+#include <cassert>
+
+void self_attn_fp16(void *x, void *wq, void *xq, int bs, int nheads, int head_dim,
+                    int cluster_num) {
+  assert((nheads * head_dim) % 128 == 0);
+  assert(nheads % ATTN_FP16_HEAD_MICROBATCH == 0);
+  assert((ATTN_FP16_HEAD_MICROBATCH * head_dim) % (4 * ATTN_FP16_PROJ_NANOBATCH) == 0);
+  assert(bs < ATTN_FP16_BATCH_MICROBATCH || bs % ATTN_FP16_BATCH_MICROBATCH == 0);
+  cnrtDim3_t k_dim = (cnrtDim3_t){4, (unsigned int)cluster_num, 1};
+  cnrtFunctionType_t k_type = CNRT_FUNC_TYPE_UNION1;
+  mm_fp16<<<k_dim, k_type, NULL>>>((half *)x, (half *)wq, (half *)xq, bs, nheads, head_dim);
+}
+
+} // namespace mlu_detail

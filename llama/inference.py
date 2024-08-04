@@ -1,6 +1,6 @@
 import time, os, gc
 import json
-import psutil
+# import psutil
 from pathlib import Path
 from typing import Optional, List
 
@@ -12,6 +12,7 @@ from tqdm import tqdm
 from .global_args import DistributedArgs, ModelArgs
 from .model import Transformer
 from . import mlu as backend
+from .timer import _GLOBAL_TIMER
 
 def get_distributed_args() -> DistributedArgs:
     world_size = 1 
@@ -25,7 +26,7 @@ def get_distributed_args() -> DistributedArgs:
         world_rank = int(os.environ.get("RANK", default=0))
         local_rank = int(os.environ.get("LOCAL_RANK", default=0))
         assert world_rank < world_size, f"world_rank({world_rank}) < world_size({world_size}) check failed"
-    device_id = local_rank
+    device_id = local_rank + 4
     dist_args = DistributedArgs(world_size, world_rank, local_rank, device_id)
     dist_args.default_group = backend.init_dev(dist_args)
     
@@ -85,18 +86,17 @@ class LLaMA:
             # The only unmatched key in the checkpoint is rope.freqs. Remove it
             del checkpoint['rope.freqs']
             model.load_state_dict(checkpoint, strict=True)
-            print(f"Loaded state dict in {time.time() - prev_time:.2f}s")
-        del checkpoint
-        gc.collect()
+            print(f"Loaded state dict in {time.time() - prev_time:.2f}s", flush=True)
+            del checkpoint
+            gc.collect()
             
         model.crop_parameter()
-        print("done cropping parameters")
+        print("done cropping parameters", flush=True)
         model = model.to(model_args.device)
         if False and dist_args.world_rank == 0:
             for param in model.parameters():
                 print(type(param.data), param.device, param.size())
         backend.report_gpu_memory_consumption()
-        print(psutil.virtual_memory()._asdict())
         return LLaMA(model, tokenizer, model_args, dist_args)
 
     def text_completion(self, prompts: List[str], temperature: float = 0.6, top_p: float = 0.9, max_gen_len: Optional[int] = None):
@@ -118,15 +118,22 @@ class LLaMA:
         for k, t in enumerate(prompt_tokens):
             # Populate the initial tokens with the prompt tokens
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long)
-        tokens = tokens.to(self.args.device)
+        tokens_dev = tokens.to(self.args.device)
         
         eos_reached = torch.tensor([False] * batch_size)
         prompt_tokens_mask = tokens != pad_id # True if the token is a prompt token, False otherwise
-        cur_iterator = tqdm(range(1, total_len), desc="Generating tokens")
+        if self.dist_args.is_rank_0():
+            cur_iterator = tqdm(range(1, total_len), desc="Generating tokens")
+        else:
+            cur_iterator = range(1, total_len)
         for cur_pos in cur_iterator:
-            #print("pos=", cur_pos, ", tokens=", tokens[:, cur_pos-1:cur_pos].cpu().contiguous().flatten())
-            logits = self.model.forward(tokens[:, cur_pos-1:cur_pos], cur_pos)
-            backend.report_gpu_memory_consumption()
+            # print("pos=", cur_pos, ", tokens=", tokens[:, cur_pos-1:cur_pos].cpu().contiguous().flatten())
+            logits = self.model.forward(tokens_dev[:, cur_pos-1:cur_pos], cur_pos)
+            if self.dist_args.is_rank_0():
+                _GLOBAL_TIMER.print()
+            _GLOBAL_TIMER.clear()
+            
+            # backend.report_gpu_memory_consumption()
             if temperature > 0:
                 # The temperature is applied before the softmax
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
@@ -135,21 +142,18 @@ class LLaMA:
                 # Greedily select the token with the max probability
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
-            next_token = next_token.reshape(-1)
+            next_token = next_token.reshape(-1).cpu()
             # Only replace token if it is a padding token
-            tmp = next_token.clone()
             next_token = torch.where(prompt_tokens_mask[:, cur_pos], tokens[:, cur_pos], next_token)
-            if self.dist_args.world_rank == 0:
-                print(f"{tokens[:, cur_pos]} <- {next_token[:]}")
+
             #tokens[:, cur_pos] = next_token[:]
-            tokens = torch.cat((tokens[:, :cur_pos], next_token.reshape(-1, 1), tokens[:,cur_pos+1:]), dim=1)
-            if self.dist_args.world_rank == 0:
-                print(tokens[:, cur_pos].cpu())
+            tokens_dev = torch.cat((tokens_dev[:, :cur_pos], next_token.reshape(-1, 1).to(self.args.device), tokens_dev[:,cur_pos+1:]), dim=1)
             # EOS is reached only if we found an EOS token for a padding position
             eos_reached |= (~prompt_tokens_mask[:, cur_pos]).cpu() & (next_token.cpu() == self.tokenizer.eos_id())
             if all(eos_reached):
                 break
-
+        
+        tokens = tokens_dev.cpu()
         out_tokens = []
         out_text = []
         for prompt_index, current_prompt_tokens in enumerate(tokens.tolist()):
@@ -182,12 +186,13 @@ class LLaMA:
 
 
 def inference(prompts, max_gen_len, device):
+    torch_mlu._MLUC._set_quantized_bitwidth(16)
     torch.manual_seed(0)
     torch.autograd.set_grad_enabled(False)
 
     model = LLaMA.build(
-        checkpoints_dir='../llama-2-7b-chat',
-        tokenizer_path='../tokenizer.model',
+        checkpoints_dir='/qhdx0523/llama-2-7b-chat',
+        tokenizer_path='/qhdx0523/llama-2-7b-chat/tokenizer.model',
         load_model=True,
         max_seq_len=1024,
         max_batch_size=len(prompts),
@@ -198,8 +203,11 @@ def inference(prompts, max_gen_len, device):
     if int(os.environ['RANK']) == 0:
         assert len(out_texts) == len(prompts)
         for i in range(len(out_texts)):
-            try:
-                print(f'{out_texts[i]}')
-            except:
-                pass
+            ctext = out_texts[i]
+            for j in range(len(ctext)):
+                try:
+                    print(ctext[j], end='')
+                except Exception as e:
+                    print(e)
+            print('')
             print('-' * 50)

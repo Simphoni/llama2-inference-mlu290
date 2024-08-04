@@ -5,6 +5,10 @@ import torch_mlu.core.mlu_model as mlu_drv
 import torch_mlu.distributed as mlu_dist
 from .global_args import DistributedArgs
 
+import time
+from .timer import _GLOBAL_TIMER
+from .kernels import mixed_prec_matmul as mpm
+
 initialized = False
 is_single_node = False
 args_pers = DistributedArgs()
@@ -49,8 +53,17 @@ def allreduce_sum(x: torch.Tensor):
     global initialized
     assert initialized, "calling mlu.get_device before mlu.init_dev (device not set)"
     dev = x.device
+    
+    mpm.sync()
+    a = time.time()
+    
     if not is_single_node:
         tmp = x.to(mlu_drv.mlu_device())
         dist.all_reduce(tmp, dist.ReduceOp.SUM, group=mlu_dist.get_mlu_default_group())
         x = tmp.to(dev)
-        return x
+        
+    mpm.sync()
+    b = time.time()
+    _GLOBAL_TIMER.add('AllReduce', b - a)
+
+    return x

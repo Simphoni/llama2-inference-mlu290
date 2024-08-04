@@ -4,7 +4,7 @@ The repo holds Llama2 inference code for Cambricon MLU290 (with pytorch==1.3.0).
 
 ### Features
 
-Supports simple kvcache and distributed inference. DOES NOT support flash attention, and DOES NOT separate prefill and inference.
+Supports simple kvcache and distributed inference. DOES NOT support flash attention, and DOES NOT separate prefill and decode.
 
 ### Known bugs in cambricon 'catch v1.3.0'
 

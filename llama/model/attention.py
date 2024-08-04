@@ -6,6 +6,10 @@ from ..global_args import ModelArgs, DistributedArgs
 from typing import Tuple
 from .. import mlu as backend
 
+import time
+from ..timer import _GLOBAL_TIMER
+from ..kernels import mixed_prec_matmul as mpm
+
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return x
@@ -21,6 +25,9 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: Tuple[torch.Tensor, torch.Tensor]):
+    mpm.sync();
+    a = time.time()
+    
     dims = freqs_complex[0].shape
     x_reshaped = x.view(-1, 2).transpose(0, 1)
     x_real = x_reshaped[0,:].contiguous().view(-1, *dims)
@@ -31,7 +38,12 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: Tuple[torch.Tensor, 
     x_out_image = x_real * freqs_image + x_image * freqs_real
     x_out = torch.cat([x_out_real, x_out_image], dim=-1)
     x_out = x_out.reshape(*x.shape)
-    return x_out.type_as(x)
+    x_out = x_out.type_as(x)
+    
+    mpm.sync();
+    b = time.time()
+    _GLOBAL_TIMER.add('Rotary', b - a)
+    return x_out
 
 
 class SelfAttention(nn.Module):
@@ -59,19 +71,22 @@ class SelfAttention(nn.Module):
         head_dim = self.head_dim
         head_beg = n_heads_tp * self.dist_args.model_tensor_parallel_rank
         head_end = head_beg + n_heads_tp
-        self.dwq = nn.Parameter(self.wq.weight[head_beg * head_dim : head_end * head_dim, :].clone(), requires_grad=False)
-        self.dwk = nn.Parameter(self.wk.weight[head_beg * head_dim : head_end * head_dim, :].clone(), requires_grad=False)
-        self.dwv = nn.Parameter(self.wv.weight[head_beg * head_dim : head_end * head_dim, :].clone(), requires_grad=False)
-        self.dwo = nn.Parameter(self.wo.weight[:, head_beg * head_dim : head_end * head_dim].clone(), requires_grad=False)
+        self.dwq = nn.Parameter(self.wq.weight[head_beg * head_dim : head_end * head_dim, :].t().contiguous(), requires_grad=False)
+        self.dwk = nn.Parameter(self.wk.weight[head_beg * head_dim : head_end * head_dim, :].t().contiguous(), requires_grad=False)
+        self.dwv = nn.Parameter(self.wv.weight[head_beg * head_dim : head_end * head_dim, :].t().contiguous(), requires_grad=False)
+        self.dwo = nn.Parameter(self.wo.weight[:, head_beg * head_dim : head_end * head_dim].t().contiguous(), requires_grad=False)
         del self.wq, self.wk, self.wv, self.wo
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: Tuple[torch.Tensor, torch.Tensor]):
+        mpm.sync();
+        a = time.time()
+        
         batch_size, seq_len, _ = x.shape  # (B, 1, Dim)
 
         # (B, 1, Dim) -> (B, 1, N_Head_TP * Head_Dim)
-        xq = x.matmul(self.dwq.t())
-        xk = x.matmul(self.dwk.t())
-        xv = x.matmul(self.dwv.t())
+        xq = x.matmul(self.dwq)
+        xk = x.matmul(self.dwk)
+        xv = x.matmul(self.dwv)
 
         # (B, 1, H_Q * Head_Dim) -> (B, 1, H_Q, Head_Dim)
         xq = xq.view(batch_size, seq_len, self.n_heads_tp, self.head_dim)
@@ -122,6 +137,12 @@ class SelfAttention(nn.Module):
         output = torch.matmul(scores, values)
         # (B, H_Q, 1, Head_Dim) -> (B, 1, H_Q, Head_Dim) -> (B, 1, Dim)
         output = (output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1))
-        output = output.matmul(self.dwo.t()) # (B, 1, Dim_TP) -> (B, 1, Dim)
+        output = output.matmul(self.dwo) # (B, 1, Dim_TP) -> (B, 1, Dim)
+        
+        mpm.sync();
+        b = time.time()
+        _GLOBAL_TIMER.add('Attention', b - a)
+        
         output = backend.allreduce_sum(output)
+        
         return output

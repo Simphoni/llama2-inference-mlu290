@@ -4,7 +4,10 @@ from ..global_args import ModelArgs, DistributedArgs
 from .rmsnorm import RMSNorm
 from .encoder import EncoderBlock
 from .. import mlu as backend
-from torch_mlu.core.device.notifier import Notifier
+
+import time
+from ..timer import _GLOBAL_TIMER
+from ..kernels import mixed_prec_matmul as mpm
 
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
@@ -46,6 +49,9 @@ class Transformer(nn.Module):
             encoder.crop_parameter()
 
     def forward(self, tokens: torch.Tensor, start_pos: int):
+        mpm.sync()
+        a = time.time()
+        
         # (B, Seq_Len)
         batch_size, seq_len = tokens.shape
         assert seq_len == 1, "Only one token at a time can be processed"
@@ -65,4 +71,10 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_complex)
         h = self.norm(h)
         output = self.output(h).float()
+        
+        mpm.sync()
+        b = time.time()
+        
+        _GLOBAL_TIMER.add('Transformer', b - a)
+        
         return output

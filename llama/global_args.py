@@ -1,5 +1,5 @@
+import os
 from dataclasses import dataclass
-from typing import Optional
 
 @dataclass
 class ModelArgs:
@@ -15,7 +15,7 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 128
 
-    device: str = None
+    device: str = "cpu"
     
 @dataclass
 class DistributedArgs:
@@ -27,3 +27,9 @@ class DistributedArgs:
     
     model_tensor_parallel_size: int = 1
     model_tensor_parallel_rank: int = 0
+    
+    def is_rank_0(self) -> bool:
+        return self.world_rank == 0
+
+    def is_rank_last(self) -> bool:
+        return self.world_rank + 1 == self.world_size

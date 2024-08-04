@@ -1,0 +1,90 @@
+#include <bang.h>
+
+namespace mlu_detail {
+
+namespace {
+
+__nram__ char nram_headptr[100000 * 4];
+__mlu_shared__ char sram_headptr[1044480 * 4];
+
+#define swap_float(a, b)                                                       \
+  {                                                                            \
+    float *tmp = a;                                                            \
+    a = b;                                                                     \
+    b = tmp;                                                                   \
+  }
+
+__mlu_global__ void gelu_fp32(float *src, float *dst, int n, int m) {
+  constexpr int nanobatch = 2;
+  int out_m = m / 2;
+  int group_id = taskIdY;
+  int core_id = coreId % 4;
+  int parallel_size = taskDim;
+  int parallel_idx = group_id * 4 + core_id;
+  int nanotasks = n / nanobatch;
+  int stagenum =
+      nanotasks / parallel_size + (group_id < nanotasks % parallel_size);
+
+  float *src_sram0 = (float *)sram_headptr;
+  float *src_sram1 = src_sram0 + 4 * nanobatch * m;
+  float *dst_sram0 = src_sram1 + 4 * nanobatch * m;
+  float *dst_sram1 = dst_sram0 + 4 * nanobatch * out_m;
+
+  float *src_nram = (float *)nram_headptr;
+  float *dst_nram = src_nram + nanobatch * m;
+  float *buf = dst_nram + nanobatch * m;
+
+  for (int iter = 0; iter < stagenum + 2; iter++) {
+    if (iter < stagenum) {
+      int local = iter;
+      int task_st = (parallel_idx + local * parallel_size) * nanobatch;
+      int task_ed = task_st + 4 * nanobatch;
+      if (task_ed >= n) {
+        task_ed = n;
+      }
+      int task_len = task_ed - task_st;
+      __memcpy_async(src_sram0, src + task_st * m, task_len * m * sizeof(float),
+                     GDRAM2SRAM);
+    }
+    if (2 <= iter) {
+      int local = iter - 2;
+      int task_st = (parallel_idx + local * parallel_size) * nanobatch;
+      int task_ed = task_st + 4 * nanobatch;
+      if (task_ed >= n) {
+        task_ed = n;
+      }
+      int task_len = task_ed - task_st;
+      __memcpy_async(dst + task_st * out_m, dst_sram0,
+                     task_len * m * sizeof(float), SRAM2GDRAM);
+    }
+    if (1 <= iter && iter < stagenum + 1) {
+      int task_st = core_id * nanobatch;
+      int task_len = nanobatch;
+      __memcpy(src_nram, src_sram1 + task_st * m, task_len * m * sizeof(float),
+               SRAM2NRAM);
+      float *srcit = src_nram, *dstit = dst_nram;
+      for (int i = 0; i < task_len; i++) {
+        __bang_active_sigmoid(buf, srcit, out_m);
+        __bang_mul(buf, buf, srcit, out_m);
+        __bang_mul(dstit, buf, srcit + out_m, out_m);
+        srcit += m;
+        dstit += out_m;
+      }
+      __memcpy(dst_sram1 + task_st * out_m, dst_nram,
+               task_len * out_m * sizeof(float), NRAM2SRAM);
+    }
+    __sync_cluster();
+    swap_float(src_sram0, src_sram1);
+    swap_float(dst_sram0, dst_sram1);
+  }
+}
+
+} // namespace
+
+void gelu_fp32(float *src, float *dst, int n, int m, int cluster_num) {
+  cnrtDim3_t k_dim = (cnrtDim3_t){4, (unsigned int)cluster_num, 1};
+  cnrtFunctionType_t k_type = CNRT_FUNC_TYPE_UNION1;
+  gelu_fp32<<<k_dim, k_type, NULL>>>(src, dst, n, m);
+}
+
+} // namespace mlu_detail
